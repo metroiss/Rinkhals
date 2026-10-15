@@ -84,6 +84,66 @@ def _find_pid_by_name(process_name: str) -> int:
     return None
 
 
+PRINTER_MUTABLE_CFG = "/userdata/app/gk/printer_data/config/printer_mutable.cfg"
+BED_MESH_PROFILE_ALIASES = ('bed_mesh default', 'bed_mesh "default"')
+
+
+def read_saved_bed_mesh(path=PRINTER_MUTABLE_CFG):
+    """Return (bed_mesh status, 'bed_mesh default' status) for the mesh saved
+    in printer_mutable.cfg, or ({}, {}) when there is none."""
+    if not os.path.isfile(path):
+        return {}, {}
+    with open(path, 'r') as f:
+        config = json.load(f)
+    mesh = config.get('bed_mesh default')
+    if mesh is None:
+        return {}, {}
+    points = json.loads("[[" + mesh.get('points').replace("\n", "], [") + "]]")
+    bed_mesh = {
+        "profile_name": "default",
+        "mesh_min": (float(mesh.get("min_x")), float(mesh.get("min_y"))),
+        "mesh_max": (float(mesh.get("max_x")), float(mesh.get("max_y"))),
+        "probed_matrix": points,
+        "mesh_matrix": points
+    }
+    profile = {
+        "points": points,
+        "mesh_params": {
+            "min_x": float(mesh["min_x"]),
+            "max_x": float(mesh["max_x"]),
+            "min_y": float(mesh["min_y"]),
+            "max_y": float(mesh["max_y"]),
+            "x_count": int(mesh["x_count"]),
+            "y_count": int(mesh["y_count"]),
+            "mesh_x_pps": int(mesh["mesh_x_pps"]),
+            "mesh_y_pps": int(mesh["mesh_y_pps"]),
+            "tension": float(mesh["tension"]),
+            "algo": mesh["algo"]
+        }
+    }
+    return bed_mesh, profile
+
+
+def is_live_bed_mesh(status):
+    """True when gklib's own bed_mesh status holds a probed mesh.
+
+    GoKlipper keeps a Klipper-style bed_mesh status (profile_name, mesh_min,
+    mesh_max, probed_matrix, mesh_matrix, profiles), rebuilt by
+    BedMesh.Set_mesh -> Update_status whenever a mesh is calibrated, loaded or
+    cleared (KS1 fw 2.7.2.7: Update_status 0x4c5ee0, Get_status 0x4c5ed0).
+    Adaptive meshes (BED_MESH_CALIBRATE ADAPTIVE=1) are never written to
+    printer_mutable.cfg, so this is the only place they show up.
+    """
+    if not isinstance(status, dict):
+        return False
+    matrix = status.get('probed_matrix')
+    if not isinstance(matrix, (list, tuple)) or not matrix:
+        return False
+    if not all(isinstance(row, (list, tuple)) and row for row in matrix):
+        return False
+    return status.get('mesh_min') is not None and status.get('mesh_max') is not None
+
+
 class Kobra:
     # Environment
     KOBRA_MODEL_ID = None
@@ -1291,59 +1351,57 @@ class Kobra:
             async def _request_standard(me, web_request, timeout = None):
                 args = web_request.get_args()
 
-                # Do not send bed_mesh to goklipper, it does not support it
+                # GoKlipper has no "bed_mesh default" style profile objects,
+                # so those are answered here from printer_mutable.cfg. The
+                # plain "bed_mesh" object is passed through to gklib, which
+                # reports the mesh actually in use, including adaptive meshes
+                # that are never saved. If gklib has no mesh loaded, or the
+                # query fails, fall back to the saved mesh as before.
                 want_bed_mesh = False
+                ask_live = False
                 if self.is_goklipper_running():
-                    if 'objects' in args and ('bed_mesh' in args['objects'] or 'bed_mesh default' in args['objects'] or 'bed_mesh \"default\"' in args['objects']):
+                    objects = args.get('objects') if isinstance(args, dict) else None
+                    if isinstance(objects, dict) and any(k in objects for k in ('bed_mesh',) + BED_MESH_PROFILE_ALIASES):
                         want_bed_mesh = True
-                        if 'bed_mesh' in args['objects']:
-                            del args['objects']['bed_mesh']
-                        if 'bed_mesh default' in args['objects']:
-                            del args['objects']['bed_mesh default']
-                        if 'bed_mesh \"default\"' in args['objects']:
-                            del args['objects']['bed_mesh \"default\"']
+                        ask_live = 'bed_mesh' in objects and getattr(self, 'live_bed_mesh', True)
+                        for alias in BED_MESH_PROFILE_ALIASES:
+                            objects.pop(alias, None)
+                        if not ask_live:
+                            objects.pop('bed_mesh', None)
 
-                result = await original__request_standard(me, web_request, timeout)
+                try:
+                    result = await original__request_standard(me, web_request, timeout)
+                except Exception:
+                    if not ask_live:
+                        raise
+                    logging.exception('[Kobra] gklib rejected the bed_mesh query, using the saved mesh only')
+                    self.live_bed_mesh = False
+                    args['objects'].pop('bed_mesh', None)
+                    result = await original__request_standard(me, web_request, timeout)
 
                 # Add bed_mesh, so mainsail will recognize it
                 if want_bed_mesh:
                     if 'status' not in result:
                         result['status'] = {}
+                    status = result['status']
 
-                    result['status']['bed_mesh'] = {}
-                    result['status']['bed_mesh default'] = {}
-                    result['status']['bed_mesh \"default\"'] = {}
+                    try:
+                        saved_mesh, saved_profile = read_saved_bed_mesh()
+                    except Exception:
+                        logging.exception('[Kobra] Could not read the saved bed mesh')
+                        saved_mesh, saved_profile = {}, {}
 
-                    if os.path.isfile("/userdata/app/gk/printer_data/config/printer_mutable.cfg"):
-                        with open('/userdata/app/gk/printer_data/config/printer_mutable.cfg', 'r') as f:
-                            config = json.load(f)
-                            mesh = config.get('bed_mesh default')
-                            if not mesh is None:
-                                points = json.loads("[[" + mesh.get('points').replace("\n", "], [") + "]]")
+                    live_mesh = status.get('bed_mesh')
+                    if is_live_bed_mesh(live_mesh):
+                        bed_mesh = dict(live_mesh)
+                        if not bed_mesh.get('profile_name'):
+                            bed_mesh['profile_name'] = 'adaptive'
+                    else:
+                        bed_mesh = saved_mesh
 
-                                result['status']['bed_mesh'] = {
-                                    "profile_name": "default",
-                                    "mesh_min": (float(mesh.get("min_x")), float(mesh.get("min_y"))),
-                                    "mesh_max": (float(mesh.get("max_x")), float(mesh.get("max_y"))),
-                                    "probed_matrix": points,
-                                    "mesh_matrix": points
-                                }
-                                result['status']['bed_mesh default'] = {
-                                    "points": points,
-                                    "mesh_params": {
-                                        "min_x": float(mesh["min_x"]),
-                                        "max_x": float(mesh["max_x"]),
-                                        "min_y": float(mesh["min_y"]),
-                                        "max_y": float(mesh["max_y"]),
-                                        "x_count": int(mesh["x_count"]),
-                                        "y_count": int(mesh["y_count"]),
-                                        "mesh_x_pps": int(mesh["mesh_x_pps"]),
-                                        "mesh_y_pps": int(mesh["mesh_y_pps"]),
-                                        "tension": float(mesh["tension"]),
-                                        "algo": mesh["algo"]
-                                    }
-                                }
-                                #result['status']['bed_mesh \"default\"'] = result['status']['bed_mesh default']
+                    status['bed_mesh'] = bed_mesh
+                    status['bed_mesh default'] = saved_profile
+                    status['bed_mesh "default"'] = {}
                 return result
             return _request_standard
 
