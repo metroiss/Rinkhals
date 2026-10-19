@@ -86,10 +86,12 @@ class LiveBedMeshTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    async def _query(self, live_status, objects, reject=False):
+    async def _query(self, live_status, objects, reject=False, model="KS1", version="2.7.2.7"):
         conn_module = build_connection_module(live_status, reject)
         kobra = self.module.Kobra.__new__(self.module.Kobra)
         kobra.is_goklipper_running = lambda: True
+        kobra.KOBRA_MODEL_CODE = model
+        kobra.KOBRA_VERSION = version
         kobra.patch_bed_mesh()
         conn = conn_module.KlippyConnection()
         req = DummyWebRequest("objects/subscribe", {"objects": objects})
@@ -124,6 +126,18 @@ class LiveBedMeshTests(unittest.IsolatedAsyncioTestCase):
         result, conn, _ = await self._query(LIVE, {"bed_mesh default": None})
         self.assertEqual(conn.sent[0]["objects"], {})
         self.assertEqual(result["status"]["bed_mesh"]["profile_name"], "default")
+
+    async def test_unverified_model_never_sends_bed_mesh_to_gklib(self):
+        for model, version in (("KS1M", "2.7.2.1"), ("K3", "2.4.6.7"), ("KS1", "2.7.2.1"), (None, None)):
+            with self.subTest(model=model, version=version):
+                result, conn, _ = await self._query(LIVE, {"bed_mesh": None}, model=model, version=version)
+                self.assertNotIn("bed_mesh", conn.sent[0]["objects"])
+                self.assertEqual(len(conn.sent), 1)
+                self.assertEqual(result["status"]["bed_mesh"]["profile_name"], "default")
+                self.assertEqual(result["status"]["bed_mesh"]["mesh_min"], (5.0, 5.0))
+
+    def test_verified_list(self):
+        self.assertEqual(tuple(self.module.LIVE_BED_MESH_VERIFIED), (("KS1", "2.7.2.7"),))
 
     def test_is_live_bed_mesh(self):
         f = self.module.is_live_bed_mesh

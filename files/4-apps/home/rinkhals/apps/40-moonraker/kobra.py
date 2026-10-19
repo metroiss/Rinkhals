@@ -161,6 +161,16 @@ def is_live_bed_mesh(status):
     return status.get('mesh_min') is not None and status.get('mesh_max') is not None
 
 
+# Model and firmware combinations where querying gklib's own bed_mesh object
+# has been verified on a printer. GoKlipper can panic on objects it does not
+# support (KS1M crashes on motion_report rather than returning an error), so
+# every other combination keeps answering bed_mesh from printer_mutable.cfg.
+# Add entries one at a time once confirmed on that model and firmware.
+LIVE_BED_MESH_VERIFIED = (
+    ('KS1', '2.7.2.7'),
+)
+
+
 class Kobra:
     # Environment
     KOBRA_MODEL_ID = None
@@ -282,6 +292,9 @@ class Kobra:
 
             await self.power.add_device('chamber_light', ShellPowerDevice(config.getsection('power chamber_light')))
 
+
+    def live_bed_mesh_supported(self):
+        return (self.KOBRA_MODEL_CODE, self.KOBRA_VERSION) in LIVE_BED_MESH_VERIFIED
 
     def is_goklipper_running(self):
         if time.time() < self._goklipper_next_check:
@@ -1377,15 +1390,19 @@ class Kobra:
                 # so those are answered here from printer_mutable.cfg. The
                 # plain "bed_mesh" object is passed through to gklib, which
                 # reports the mesh actually in use, including adaptive meshes
-                # that are never saved. If gklib has no mesh loaded, or the
-                # query fails, fall back to the saved mesh as before.
+                # that are never saved, but only on the model and firmware
+                # combinations in LIVE_BED_MESH_VERIFIED; everywhere else
+                # gklib never sees bed_mesh. If gklib has no mesh loaded, or
+                # the query fails, fall back to the saved mesh as before.
                 want_bed_mesh = False
                 ask_live = False
                 if self.is_goklipper_running():
                     objects = args.get('objects') if isinstance(args, dict) else None
                     if isinstance(objects, dict) and any(k in objects for k in ('bed_mesh',) + BED_MESH_PROFILE_ALIASES):
                         want_bed_mesh = True
-                        ask_live = 'bed_mesh' in objects and getattr(self, 'live_bed_mesh', True)
+                        ask_live = ('bed_mesh' in objects and
+                                    self.live_bed_mesh_supported() and
+                                    getattr(self, 'live_bed_mesh', True))
                         for alias in BED_MESH_PROFILE_ALIASES:
                             objects.pop(alias, None)
                         if not ask_live:
