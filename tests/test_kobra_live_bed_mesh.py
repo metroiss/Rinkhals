@@ -134,5 +134,50 @@ class LiveBedMeshTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(f({"probed_matrix": [[1.0]], "mesh_min": None, "mesh_max": [1, 1]}))
 
 
+
+class ScriptRequest(DummyWebRequest):
+    def get_str(self, key, default=None):
+        return self._args.get(key, default)
+
+
+class BedMeshProfileQuotingTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_kobra_module()
+
+    async def _send(self, script):
+        conn_module = build_connection_module()
+        kobra = self.module.Kobra.__new__(self.module.Kobra)
+        kobra.is_goklipper_running = lambda: True
+        kobra.server = types.SimpleNamespace(error=RuntimeError)
+        kobra.patch_bed_mesh()
+        req = ScriptRequest("gcode/script", {"script": script})
+        await conn_module.KlippyConnection().request(req)
+        return req.get_args()["script"]
+
+    async def test_mainsail_load_button_is_unquoted(self):
+        self.assertEqual(await self._send('BED_MESH_PROFILE LOAD="adaptive"'),
+                         "BED_MESH_PROFILE LOAD=adaptive")
+
+    async def test_unquoted_load_is_unchanged(self):
+        self.assertEqual(await self._send("BED_MESH_PROFILE LOAD=default"),
+                         "BED_MESH_PROFILE LOAD=default")
+
+    async def test_quoted_save_default_is_allowed(self):
+        self.assertEqual(await self._send('BED_MESH_PROFILE SAVE="default"'),
+                         "BED_MESH_PROFILE SAVE=default")
+
+    async def test_quoted_save_other_name_is_still_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "only support one default bed mesh"):
+            await self._send('BED_MESH_PROFILE SAVE="other"')
+
+    def test_normalize_bed_mesh_profile_script(self):
+        f = self.module.normalize_bed_mesh_profile_script
+        self.assertEqual(f('BED_MESH_PROFILE REMOVE="adaptive"'), "BED_MESH_PROFILE REMOVE=adaptive")
+        self.assertEqual(f("bed_mesh_profile load='adaptive'"), "bed_mesh_profile load=adaptive")
+        self.assertEqual(f('BED_MESH_PROFILE LOAD="two words"'), 'BED_MESH_PROFILE LOAD="two words"')
+        self.assertEqual(f('SET_GCODE_OFFSET Z="1"'), 'SET_GCODE_OFFSET Z="1"')
+        self.assertEqual(f(""), "")
+
 if __name__ == "__main__":
     unittest.main()

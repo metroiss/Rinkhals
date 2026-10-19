@@ -124,6 +124,23 @@ def read_saved_bed_mesh(path=PRINTER_MUTABLE_CFG):
     return bed_mesh, profile
 
 
+_BED_MESH_PROFILE_QUOTED = re.compile(r'\b(LOAD|SAVE|REMOVE)=(["\'])([^\s"\']+)\2', re.IGNORECASE)
+
+
+def normalize_bed_mesh_profile_script(script):
+    """Remove quotes around BED_MESH_PROFILE LOAD/SAVE/REMOVE names.
+
+    Mainsail and Fluidd send BED_MESH_PROFILE LOAD="name". Klipper strips the
+    quotes, but GoKlipper takes the value literally, looks for a profile named
+    "name" including the quotes, finds none and silently does nothing.
+    Verified on a KS1 (fw 2.7.2.7): LOAD="adaptive" is ignored, LOAD=adaptive
+    loads the profile. Names containing whitespace are left untouched.
+    """
+    if not script or not script.strip().upper().startswith('BED_MESH_PROFILE'):
+        return script
+    return _BED_MESH_PROFILE_QUOTED.sub(lambda m: f'{m.group(1)}={m.group(3)}', script)
+
+
 def is_live_bed_mesh(status):
     """True when gklib's own bed_mesh status holds a probed mesh.
 
@@ -1331,6 +1348,11 @@ class Kobra:
 
                         web_request.get_args()["script"] = '\n'.join(calibrate_script)
                     elif script.lower().startswith('bed_mesh_profile'):
+                        normalized_script = normalize_bed_mesh_profile_script(script)
+                        if normalized_script != script:
+                            logging.info(f'[Kobra] Normalized bed mesh profile quoting: {script} -> {normalized_script}')
+                            web_request.get_args()['script'] = normalized_script
+                            script = normalized_script
                         name = re.search(r'save=("(?:[^"]+)"|(?:[^\s]+))', script.lower())
                         if name and name[1] != 'default':
                             message = 'GoKlipper only support one default bed mesh'
